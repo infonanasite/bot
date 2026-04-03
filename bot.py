@@ -34,27 +34,25 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "nyxvectorXbot")
 LOG_CHANNEL = os.getenv("LOG_CHANNEL", "@NyxVectorBackup")
 
-# TiDB Cloud connection
 DB_HOST = os.getenv("DB_HOST", "gateway01.eu-central-1.prod.aws.tidbcloud.com")
 DB_PORT = int(os.getenv("DB_PORT", "4000"))
 DB_USER = os.getenv("DB_USER", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_NAME = os.getenv("DB_NAME", "sys")
+DB_NAME = os.getenv("DB_NAME", "giveaway_db")
 
 REFERRAL_REWARD_COUNT = 5
 
-# Global state
+# Global state (will be attached to app)
+db_pool = None
 awaiting_screenshot = {}
 awaiting_netflix_data = {}
 awaiting_delete_all = {}
 user_states = {}
 ADMIN_IDS = set()
-db_pool = None
 
-# ========== DATABASE SETUP ==========
-async def init_db():
+# ========== DATABASE CONNECTION ==========
+async def init_db(app: Application):
     global db_pool
-    # Create SSL context for TiDB Cloud (required)
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -70,68 +68,29 @@ async def init_db():
         maxsize=5,
         ssl=ssl_ctx
     )
-    async with db_pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            # Create tables if not exist
-            await cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    username VARCHAR(255),
-                    first_name VARCHAR(255),
-                    last_name VARCHAR(255),
-                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    referrer_id BIGINT,
-                    referral_code VARCHAR(50) UNIQUE,
-                    referral_count INT DEFAULT 0
-                )
-            """)
-            await cur.execute("""
-                CREATE TABLE IF NOT EXISTS codes (
-                    code VARCHAR(100) PRIMARY KEY,
-                    message TEXT,
-                    is_used INT DEFAULT 0,
-                    used_by BIGINT,
-                    used_at TIMESTAMP
-                )
-            """)
-            await cur.execute("""
-                CREATE TABLE IF NOT EXISTS redemptions (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id BIGINT,
-                    code VARCHAR(100),
-                    prize_message TEXT,
-                    redeemed_at TIMESTAMP,
-                    screenshot_sent INT DEFAULT 0,
-                    screenshot_file_id VARCHAR(255),
-                    submitted_at TIMESTAMP
-                )
-            """)
-            await cur.execute("""
-                CREATE TABLE IF NOT EXISTS required_channels (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    channel_username VARCHAR(100) UNIQUE
-                )
-            """)
-            await cur.execute("""
-                CREATE TABLE IF NOT EXISTS admins (
-                    user_id BIGINT PRIMARY KEY
-                )
-            """)
-    logger.info("✅ Database connected and tables ready")
+    # Note: tables already exist manually
+    app.bot_data['db_pool'] = db_pool
+    logger.info("✅ Database connected")
 
-async def load_admins():
-    global ADMIN_IDS
+    # Load admins
     async with db_pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute("SELECT user_id FROM admins")
             rows = await cur.fetchall()
-            ADMIN_IDS = {row[0] for row in rows}
+            ADMIN_IDS.update(row[0] for row in rows)
             if OWNER_ID:
                 ADMIN_IDS.add(OWNER_ID)
                 await cur.execute("INSERT IGNORE INTO admins (user_id) VALUES (%s)", (OWNER_ID,))
     logger.info(f"Admins: {ADMIN_IDS}")
 
-# ========== SHORTENED DATABASE FUNCTIONS (keep all needed) ==========
+async def close_db(app: Application):
+    global db_pool
+    if db_pool:
+        db_pool.close()
+        await db_pool.wait_closed()
+        logger.info("Database pool closed")
+
+# ========== DATABASE HELPERS (using global db_pool) ==========
 async def register_user(user_id, username, first_name, last_name, referrer_code=None):
     async with db_pool.acquire() as conn:
         async with conn.cursor() as cur:
@@ -452,7 +411,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in user_states:
         state = user_states.pop(uid)["state"]
         if state == "waiting_redeem":
-            # Call redeem command
             result, prize = await redeem_code(text, uid)
             if result == "invalid":
                 await update.message.reply_text("❌ Invalid code.")
@@ -603,10 +561,6 @@ async def delall_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Cancelled.")
     await query.message.reply_text("Main menu:", reply_markup=get_main_keyboard(uid))
 
-async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This is for future channel join verification – not needed for core but kept
-    pass
-
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
     if update and update.effective_message:
@@ -616,37 +570,34 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ========== MAIN ==========
-async def main():
+def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not set")
         sys.exit(1)
     if not DB_USER or not DB_PASSWORD:
         logger.error("Database credentials missing")
         sys.exit(1)
-    await init_db()
-    await load_admins()
+
+    # Build application
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_error_handler(error_handler)
 
+    # Add handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("redeem", lambda u,c: None))  # handled by text
-    app.add_handler(CommandHandler("check", lambda u,c: None))
-    app.add_handler(CommandHandler("ref", lambda u,c: None))
-    app.add_handler(CommandHandler("referrals", lambda u,c: None))
-    app.add_handler(CommandHandler("help", lambda u,c: None))
-
     app.add_handler(CallbackQueryHandler(button_callback, pattern="^(redeem_prompt|ref|referrals|check_code|help|admin_panel|cancel|back_to_start)$"))
     app.add_handler(CallbackQueryHandler(admin_button_callback, pattern="^admin_"))
     app.add_handler(CallbackQueryHandler(delall_callback, pattern="^delall_"))
-    app.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join_"))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_netflix_data))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_error_handler(error_handler)
 
-    logger.info("Bot started polling")
-    await app.run_polling()
+    # Register startup and shutdown events
+    app.post_init = init_db
+    app.post_shutdown = close_db
+
+    # Run the bot (this will handle the event loop correctly)
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
